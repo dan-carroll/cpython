@@ -844,7 +844,7 @@ _ldict(localobject *self)
         }
     }
     else {
-        assert(Py_TYPE(dummy) == &localdummytype);
+        assert(Py_IS_TYPE(dummy, &localdummytype));
         ldict = ((localdummyobject *) dummy)->localdict;
     }
 
@@ -938,7 +938,7 @@ local_getattro(localobject *self, PyObject *name)
     if (r == -1)
         return NULL;
 
-    if (Py_TYPE(self) != &localtype)
+    if (!Py_IS_TYPE(self, &localtype))
         /* use generic lookup for subtypes */
         return _PyObject_GenericGetAttrWithDict(
             (PyObject *)self, name, ldict, 0);
@@ -993,6 +993,7 @@ struct bootstate {
     PyObject *args;
     PyObject *keyw;
     PyThreadState *tstate;
+    _PyRuntimeState *runtime;
 };
 
 static void
@@ -1000,11 +1001,13 @@ t_bootstrap(void *boot_raw)
 {
     struct bootstate *boot = (struct bootstate *) boot_raw;
     PyThreadState *tstate;
+    _PyRuntimeState *runtime;
     PyObject *res;
 
+    runtime = boot->runtime;
     tstate = boot->tstate;
     tstate->thread_id = PyThread_get_thread_ident();
-    _PyThreadState_Init(&_PyRuntime, tstate);
+    _PyThreadState_Init(tstate);
     PyEval_AcquireThread(tstate);
     tstate->interp->num_threads++;
     res = PyObject_Call(boot->func, boot->args, boot->keyw);
@@ -1025,13 +1028,14 @@ t_bootstrap(void *boot_raw)
     PyMem_DEL(boot_raw);
     tstate->interp->num_threads--;
     PyThreadState_Clear(tstate);
-    PyThreadState_DeleteCurrent();
+    _PyThreadState_DeleteCurrent(runtime);
     PyThread_exit_thread();
 }
 
 static PyObject *
 thread_PyThread_start_new_thread(PyObject *self, PyObject *fargs)
 {
+    _PyRuntimeState *runtime = &_PyRuntime;
     PyObject *func, *args, *keyw = NULL;
     struct bootstate *boot;
     unsigned long ident;
@@ -1062,6 +1066,7 @@ thread_PyThread_start_new_thread(PyObject *self, PyObject *fargs)
     boot->args = args;
     boot->keyw = keyw;
     boot->tstate = _PyThreadState_Prealloc(boot->interp);
+    boot->runtime = runtime;
     if (boot->tstate == NULL) {
         PyMem_DEL(boot);
         return PyErr_NoMemory();
@@ -1069,7 +1074,7 @@ thread_PyThread_start_new_thread(PyObject *self, PyObject *fargs)
     Py_INCREF(func);
     Py_INCREF(args);
     Py_XINCREF(keyw);
-    PyEval_InitThreads(); /* Start the interpreter's thread-awareness */
+
     ident = PyThread_start_new_thread(t_bootstrap, (void*) boot);
     if (ident == PYTHREAD_INVALID_THREAD_ID) {
         PyErr_SetString(ThreadError, "can't start new thread");
@@ -1204,7 +1209,7 @@ release_sentinel(void *wr_raw)
     PyObject *obj = PyWeakref_GET_OBJECT(wr);
     lockobject *lock;
     if (obj != Py_None) {
-        assert(Py_TYPE(obj) == &Locktype);
+        assert(Py_IS_TYPE(obj, &Locktype));
         lock = (lockobject *) obj;
         if (lock->locked) {
             PyThread_release_lock(lock->lock_lock);
@@ -1313,6 +1318,7 @@ static int
 thread_excepthook_file(PyObject *file, PyObject *exc_type, PyObject *exc_value,
                        PyObject *exc_traceback, PyObject *thread)
 {
+    _Py_IDENTIFIER(name);
     /* print(f"Exception in thread {thread.name}:", file=file) */
     if (PyFile_WriteString("Exception in thread ", file) < 0) {
         return -1;
@@ -1320,7 +1326,9 @@ thread_excepthook_file(PyObject *file, PyObject *exc_type, PyObject *exc_value,
 
     PyObject *name = NULL;
     if (thread != Py_None) {
-        name = PyObject_GetAttrString(thread, "name");
+        if (_PyObject_LookupAttrId(thread, &PyId_name, &name) < 0) {
+            return -1;
+        }
     }
     if (name != NULL) {
         if (PyFile_WriteObject(name, file, Py_PRINT_RAW) < 0) {
@@ -1330,8 +1338,6 @@ thread_excepthook_file(PyObject *file, PyObject *exc_type, PyObject *exc_value,
         Py_DECREF(name);
     }
     else {
-        PyErr_Clear();
-
         unsigned long ident = PyThread_get_thread_ident();
         PyObject *str = PyUnicode_FromFormat("%lu", ident);
         if (str != NULL) {
@@ -1394,7 +1400,7 @@ static PyStructSequence_Desc ExceptHookArgs_desc = {
 static PyObject *
 thread_excepthook(PyObject *self, PyObject *args)
 {
-    if (Py_TYPE(args) != &ExceptHookArgsType) {
+    if (!Py_IS_TYPE(args, &ExceptHookArgsType)) {
         PyErr_SetString(PyExc_TypeError,
                         "_thread.excepthook argument type "
                         "must be ExceptHookArgs");
@@ -1460,9 +1466,9 @@ static PyObject *
 _thread__is_main_interpreter_impl(PyObject *module)
 /*[clinic end generated code: output=7dd82e1728339adc input=cc1eb00fd4598915]*/
 {
-    _PyRuntimeState *runtime = &_PyRuntime;
-    PyInterpreterState *interp = _PyRuntimeState_GetThreadState(runtime)->interp;
-    return PyBool_FromLong(interp == runtime->interpreters.main);
+    PyThreadState *tstate = _PyThreadState_GET();
+    int is_main = _Py_IsMainInterpreter(tstate);
+    return PyBool_FromLong(is_main);
 }
 
 static PyMethodDef thread_methods[] = {
